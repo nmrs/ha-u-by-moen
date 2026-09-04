@@ -24,7 +24,26 @@ class MoenDataUpdateCoordinator(DataUpdateCoordinator):
             update_interval=timedelta(seconds=UPDATE_INTERVAL),
         )
         self.api = api
+        self.local = None  # Optional MoenLocal — set by __init__ when pairing file exists
         self.devices: Dict[str, Dict[str, Any]] = {}
+
+    async def _async_merge_local(self, devices_data: Dict[str, Dict[str, Any]]) -> None:
+        """Overlay freshly-read local HAP state onto the cloud device data."""
+        if not self.local:
+            return
+        try:
+            state = await self.local.read_state()
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Local HAP read failed, using cloud data only: %s", err)
+            return
+        for device_data in devices_data.values():
+            device_data["mode"] = "adjusting" if state["main"] else "off"
+            device_data["current_temperature"] = state["current_temp_f"]
+            device_data["target_temperature"] = state["target_temp_f"]
+            for outlet in device_data.get("outlets", []):
+                pos = outlet.get("position")
+                if pos in state["outlets"]:
+                    outlet["active"] = state["outlets"][pos]
 
     async def _async_update_data(self) -> Dict[str, Dict[str, Any]]:
         """Fetch data from API."""
@@ -46,6 +65,9 @@ class MoenDataUpdateCoordinator(DataUpdateCoordinator):
                     # Keep existing data if update fails
                     if serial_number in self.devices:
                         devices_data[serial_number] = self.devices[serial_number]
+
+            # Local HAP reads are the source of truth for outlets/temps/mode
+            await self._async_merge_local(devices_data)
 
             self.devices = devices_data
             return devices_data

@@ -9,6 +9,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .api import MoenApi
 from .const import DOMAIN
 from .coordinator import MoenDataUpdateCoordinator
+from .local import MoenLocal
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -38,6 +39,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Create coordinator
     coordinator = MoenDataUpdateCoordinator(hass, api)
 
+    # Local HAP transport (pairing file present in /config) — optional
+    local = MoenLocal.load_from_config(hass)
+    if local:
+        coordinator.local = local
+        _LOGGER.info("Local HAP transport enabled (u_by_moen_hap.json found)")
+
     # Fetch initial data
     await coordinator.async_config_entry_first_refresh()
 
@@ -45,6 +52,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN][entry.entry_id] = {
         "coordinator": coordinator,
         "api": api,
+        "local": local,
     }
 
     # Set up platforms
@@ -130,6 +138,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # Disconnect from Pusher
         api = hass.data[DOMAIN][entry.entry_id]["api"]
         await api.disconnect_pusher()
+
+        local = hass.data[DOMAIN][entry.entry_id].get("local")
+        if local:
+            await local.close()
 
         # Remove the entry
         hass.data[DOMAIN].pop(entry.entry_id)

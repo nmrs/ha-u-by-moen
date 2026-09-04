@@ -33,6 +33,17 @@ OUTLET_ICONS = {
 }
 
 
+def _local_transport(coordinator):
+    """Return the optional local HAP transport from the coordinator."""
+    return getattr(coordinator, "local", None)
+
+
+def _main_is_on(device_data: dict) -> bool:
+    """True when the shower is running (any non-off mode)."""
+    mode = device_data.get("mode", MODE_OFF)
+    return mode not in (MODE_OFF, MODE_PAUSED_BY_PRESET)
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -114,6 +125,13 @@ class MoenShowerSwitch(CoordinatorEntity, SwitchEntity):
         """Turn the shower on."""
         self._optimistic_state = True  # Optimistically assume it worked
         self.async_write_ha_state()  # Update UI immediately
+        local = _local_transport(self.coordinator)
+        if local:
+            try:
+                await local.set_main(True)
+                return
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.error("Local main-on failed, falling back to cloud: %s", err)
         device_data = self.coordinator.data[self._serial_number]
         mode = device_data.get("mode", MODE_OFF)
         active_preset = device_data.get("active_preset")
@@ -127,6 +145,13 @@ class MoenShowerSwitch(CoordinatorEntity, SwitchEntity):
         """Turn the shower off."""
         self._optimistic_state = False  # Optimistically assume it worked
         self.async_write_ha_state()  # Update UI immediately
+        local = _local_transport(self.coordinator)
+        if local:
+            try:
+                await local.set_main(False)
+                return
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.error("Local main-off failed, falling back to cloud: %s", err)
         await self._api.set_shower_mode(self._serial_number, MODE_OFF)
         # State will be confirmed via Pusher client-state-reported event
 
@@ -173,15 +198,7 @@ class MoenOutletSwitch(CoordinatorEntity, SwitchEntity):
         """Return the name of the outlet switch."""
         device_data = self.coordinator.data[self._serial_number]
         device_name = device_data.get("name", f"Shower {self._serial_number}")
-
-        # Get outlet name from icon index
-        outlet = self._get_outlet_data()
-        if outlet:
-            icon_index = outlet.get("icon_index", 0)
-            outlet_type = self._get_outlet_type(icon_index)
-            return f"{device_name} {outlet_type}"
-
-        return f"{device_name} Outlet {self._outlet_position}"
+        return f"{device_name} Valve {self._outlet_position}"
 
     @property
     def icon(self) -> str:
@@ -210,14 +227,36 @@ class MoenOutletSwitch(CoordinatorEntity, SwitchEntity):
         self.async_write_ha_state()  # Update UI immediately
 
         device_data = self.coordinator.data[self._serial_number]
+        local = _local_transport(self.coordinator)
+        if local:
+            try:
+                await local.set_outlet(
+                    self._outlet_position, True, main_is_on=_main_is_on(device_data)
+                )
+                return
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.error(
+                    "Local valve %d on failed, falling back to cloud: %s",
+                    self._outlet_position,
+                    err,
+                )
+
         current_mode = device_data.get("mode", MODE_OFF)
 
         # If shower is off, turn it on with this outlet
         if current_mode == MODE_OFF:
             _LOGGER.debug("Shower is off, turning on with outlet %d", self._outlet_position)
             await self._api.set_shower_mode(self._serial_number, "on")
-            # Wait a moment for the shower to start, then set the outlet
-            await asyncio.sleep(0.5)
+            # Wait for the device to leave 'off' before commanding outlets —
+            # the device ignores outlet commands until it reports itself on.
+            try:
+                await asyncio.wait_for(
+                    self._wait_for_running(), timeout=10
+                )
+            except TimeoutError:
+                _LOGGER.warning(
+                    "Shower did not report running in time; sending outlets_set anyway"
+                )
         elif current_mode == MODE_PAUSED_BY_PRESET:
             _LOGGER.debug(
                 "Shower paused by preset, resuming before enabling outlet %d",
@@ -249,12 +288,55 @@ class MoenOutletSwitch(CoordinatorEntity, SwitchEntity):
             await self._api.send_control_event(channel_id, "outlets_set", {"outlets": new_outlet_states})
         # State will be confirmed via Pusher client-state-reported event
 
+    async def _wait_for_running(self) -> None:
+        """Poll coordinator data until the shower reports a non-off mode."""
+        async def _running() -> bool:
+            data = self.coordinator.data[self._serial_number]
+            return data.get("mode", MODE_OFF) not in (MODE_OFF, MODE_PAUSED_BY_PRESET)
+
+        async def _request_refresh() -> None:
+            await self.coordinator.async_request_refresh()
+
+        # Poll: request a coordinator refresh (which merges a fresh local HAP
+        # read) at most ~2x/second until the device reports it is running.
+        deadline = asyncio.get_event_loop().time() + 10
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                await _request_refresh()
+            except Exception:  # noqa: BLE001
+                pass
+            if _main_is_on(self.coordinator.data[self._serial_number]):
+                return
+            await asyncio.sleep(0.5)
+        raise TimeoutError("Shower did not report running state")
+
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the outlet off."""
         self._optimistic_state = False  # Optimistically assume it worked
         self.async_write_ha_state()  # Update UI immediately
 
         device_data = self.coordinator.data[self._serial_number]
+        local = _local_transport(self.coordinator)
+        if local:
+            try:
+                await local.set_outlet(self._outlet_position, False, main_is_on=True)
+                # If this was the only active outlet, stop the shower entirely
+                outlets = device_data.get(ATTR_OUTLETS, [])
+                active_others = [
+                    o
+                    for o in outlets
+                    if o.get("active") and o.get("position") != self._outlet_position
+                ]
+                if not active_others:
+                    await local.set_main(False)
+                return
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.error(
+                    "Local valve %d off failed, falling back to cloud: %s",
+                    self._outlet_position,
+                    err,
+                )
+
         outlets = device_data.get(ATTR_OUTLETS, [])
 
         # Count how many outlets are currently active
@@ -300,16 +382,3 @@ class MoenOutletSwitch(CoordinatorEntity, SwitchEntity):
             if outlet.get("position") == self._outlet_position:
                 return outlet
         return None
-
-    def _get_outlet_type(self, icon_index: int) -> str:
-        """Get a friendly name for the outlet type."""
-        outlet_names = {
-            0: "Shower Head",
-            1: "Rain Shower",
-            2: "Hand Shower",
-            3: "Body Spray",
-            4: "Valve",
-            5: "Water Feature",
-            6: "Tub Spout",
-        }
-        return outlet_names.get(icon_index, f"Outlet {self._outlet_position}")

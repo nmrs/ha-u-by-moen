@@ -140,6 +140,13 @@ class MoenClimate(CoordinatorEntity, ClimateEntity):
         """Set new HVAC mode."""
         self._optimistic_hvac_mode = hvac_mode  # Optimistically assume it worked
         self.async_write_ha_state()  # Update UI immediately
+        local = getattr(self.coordinator, "local", None)
+        if local:
+            try:
+                await local.set_main(hvac_mode == HVACMode.HEAT)
+                return
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.error("Local hvac write failed, falling back to cloud: %s", err)
         device_data = self.coordinator.data[self._serial_number]
         mode = device_data.get(ATTR_MODE, MODE_OFF)
         if hvac_mode == HVACMode.HEAT:
@@ -160,6 +167,13 @@ class MoenClimate(CoordinatorEntity, ClimateEntity):
 
         self._optimistic_target_temp = temperature  # Optimistically assume it worked
         self.async_write_ha_state()  # Update UI immediately
+        local = getattr(self.coordinator, "local", None)
+        if local:
+            try:
+                await local.set_target_temp(temperature)
+                return
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.error("Local temp write failed, falling back to cloud: %s", err)
         await self._api.set_target_temperature(self._serial_number, temperature)
         # State will be confirmed via Pusher client-state-reported event
 
