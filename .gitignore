@@ -110,3 +110,6 @@ home-assistant.log
 home-assistant_v2.db
 
 .claude
+# Local pairing keys — never commit (deployed to /config directly)
+*u_by_moen_hap.json
+*hap_pairing.json
