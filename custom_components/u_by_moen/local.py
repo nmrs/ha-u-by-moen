@@ -48,15 +48,14 @@ class MoenLocal:
         self._lock = asyncio.Lock()
 
     @classmethod
-    def load_from_config(cls, hass):
-        """Return a MoenLocal if the pairing file exists, else None."""
+    def read_pairing_file(cls, hass):
+        """Read the pairing JSON (call via async_add_executor_job). Returns dict | None."""
         path = hass.config.path(HAP_PAIRING_FILE)
         if not os.path.isfile(path):
             return None
         try:
             with open(path) as f:
-                pairing_data = json.load(f)
-            return cls(hass, pairing_data)
+                return json.load(f)
         except (OSError, ValueError) as err:
             _LOGGER.error("Failed to load %s: %s", path, err)
             return None
@@ -73,15 +72,19 @@ class MoenLocal:
         pairs += [(1, iid) for iid in OUTLET_ACTIVE_IIDS.values()]
         result = await self._get(pairs)
 
-        def val(aid, iid):
+        def val(iid):
             return result.get((1, iid), {}).get("value", 0)
 
-        outlets = {pos: bool(val) for pos, iid in OUTLET_ACTIVE_IIDS.items() if (val := result.get((1, iid), {}).get("value")) is not None}
+        outlets = {}
+        for pos, iid in OUTLET_ACTIVE_IIDS.items():
+            raw = result.get((1, iid), {}).get("value")
+            if raw is not None:
+                outlets[pos] = bool(raw)
         return {
-            "main": bool(val(1, MAIN_ACTIVE_IID)),
+            "main": bool(val(MAIN_ACTIVE_IID)),
             "outlets": outlets,
-            "current_temp_f": c_to_f(float(val(1, HEATER_CURRENT_TEMP_IID))),
-            "target_temp_f": c_to_f(float(val(1, HEATER_TARGET_TEMP_IID))),
+            "current_temp_f": c_to_f(float(val(HEATER_CURRENT_TEMP_IID))),
+            "target_temp_f": c_to_f(float(val(HEATER_TARGET_TEMP_IID))),
         }
 
     async def set_main(self, on: bool) -> None:

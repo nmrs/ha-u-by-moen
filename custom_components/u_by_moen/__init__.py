@@ -39,8 +39,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Create coordinator
     coordinator = MoenDataUpdateCoordinator(hass, api)
 
-    # Local HAP transport (pairing file present in /config) — optional
-    local = MoenLocal.load_from_config(hass)
+    # Local HAP transport (pairing file present in /config) — optional.
+    # Read the file in an executor, but construct the pairing on the loop
+    # (aiohomekit's connection requires a running event loop).
+    pairing_data = await hass.async_add_executor_job(MoenLocal.read_pairing_file, hass)
+    local = MoenLocal(hass, pairing_data) if pairing_data else None
     if local:
         coordinator.local = local
         _LOGGER.info("Local HAP transport enabled (u_by_moen_hap.json found)")
