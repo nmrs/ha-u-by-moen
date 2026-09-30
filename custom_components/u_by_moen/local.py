@@ -192,6 +192,32 @@ class MoenLocal:
             self._last_write = time.monotonic()
         _LOGGER.debug("local: shower start (clear armed, outlet %d + temp 100F + main on)", position)
 
+    async def apply_preset(self, outlets: list[int], target_temp_f: float | None) -> None:
+        """Activate a preset locally — one session, back-to-back puts.
+
+        Shower off: arms the full outlet set + temp, then main on (start).
+        Shower running: rewrites all outlet Actives to the preset's set
+        (additive/deselecting as needed) + target temp; main stays on.
+        cloud shower_set extras (greeting/timer/notifications) have no local
+        representation and are not applied."""
+        wanted = set(outlets)
+        unknown = wanted - set(OUTLET_ACTIVE_IIDS)
+        if unknown:
+            raise ValueError(f"Unknown outlet positions {sorted(unknown)}")
+        if target_temp_f is None and not wanted:
+            raise ValueError("apply_preset needs outlets and/or target_temp_f")
+        main_on = bool(self.latest_state and self.latest_state.get("main"))
+        async with self._lock:
+            puts = [(1, iid, 1 if pos in wanted else 0) for pos, iid in OUTLET_ACTIVE_IIDS.items()]
+            if target_temp_f is not None:
+                puts.append((1, HEATER_TARGET_TEMP_IID, f_to_c(target_temp_f)))
+            if not main_on:
+                puts.append((1, MAIN_ACTIVE_IID, 1))
+            for pair in puts:
+                await self._pairing.put_characteristics([pair])
+            self._last_write = time.monotonic()
+        _LOGGER.debug("local: preset applied (outlets=%s temp=%s, main_was_on=%s)", sorted(wanted), target_temp_f, main_on)
+
     async def set_target_temp(self, fahrenheit: float) -> None:
         await self._put([(1, HEATER_TARGET_TEMP_IID, f_to_c(fahrenheit))])
         _LOGGER.debug("local: target temp %.1fF", fahrenheit)

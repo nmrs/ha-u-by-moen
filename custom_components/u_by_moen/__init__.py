@@ -3,8 +3,9 @@ import logging
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD, Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+import voluptuous as vol
 
 from .api import MoenApi
 from .const import DOMAIN
@@ -14,6 +15,18 @@ from .local import MoenLocal
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = [Platform.CLIMATE, Platform.SWITCH, Platform.SENSOR, Platform.BUTTON]
+
+SERVICE_START_LOCAL_PRESET = "start_local_preset"
+SERVICE_STOP_SHOWER = "stop_shower"
+
+START_LOCAL_PRESET_SCHEMA = vol.Schema(
+    {
+        vol.Required("outlets"): [vol.Coerce(int)],
+        vol.Optional("temperature"): vol.Coerce(float),
+    }
+)
+
+STOP_SHOWER_SCHEMA = vol.Schema({})
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -137,6 +150,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             await api.subscribe_to_channel(channel_id, callback)
             _LOGGER.info("Subscribed to updates for device %s", serial_number)
 
+    if local:
+        async def handle_start_local_preset(call: ServiceCall) -> None:
+            """Activate a preset over the local HAP transport (one session)."""
+            outlets = call.data["outlets"]
+            temperature = call.data.get("temperature")
+            await local.apply_preset(outlets, temperature)
+
+        async def handle_stop_shower(call: ServiceCall) -> None:
+            await local.set_main(False)
+
+        hass.services.async_register(
+            DOMAIN, SERVICE_START_LOCAL_PRESET, handle_start_local_preset, schema=START_LOCAL_PRESET_SCHEMA
+        )
+        hass.services.async_register(
+            DOMAIN, SERVICE_STOP_SHOWER, handle_stop_shower, schema=STOP_SHOWER_SCHEMA
+        )
+        _LOGGER.info("Registered services %s.start_local_preset / %s.stop_shower", DOMAIN, DOMAIN)
+
     return True
 
 
@@ -146,6 +177,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
     if unload_ok:
+        hass.services.async_remove(DOMAIN, SERVICE_START_LOCAL_PRESET)
+        hass.services.async_remove(DOMAIN, SERVICE_STOP_SHOWER)
         # Disconnect from Pusher
         api = hass.data[DOMAIN][entry.entry_id]["api"]
         await api.disconnect_pusher()
