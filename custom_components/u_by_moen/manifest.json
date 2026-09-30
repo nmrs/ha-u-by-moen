@@ -1,11 +1,11 @@
 {
   "domain": "u_by_moen",
   "name": "U by Moen",
-  "codeowners": ["@WeaveHubHQ"],
+  "codeowners": ["@nmrs"],
   "config_flow": true,
-  "documentation": "https://github.com/WeaveHubHQ/ha-u-by-moen",
+  "documentation": "https://github.com/nmrs/ha-u-by-moen",
   "iot_class": "cloud_push",
-  "issue_tracker": "https://github.com/WeaveHubHQ/ha-u-by-moen/issues",
-  "requirements": [],
-  "version": "1.0.3"
+  "issue_tracker": "https://github.com/nmrs/ha-u-by-moen/issues",
+  "requirements": ["aiohomekit"],
+  "version": "1.1.0"
 }
