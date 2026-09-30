@@ -33,6 +33,14 @@ MODE_ADJUSTING = "adjusting"  # Shower is on and heating/cooling
 MODE_READY = "ready"  # Shower is on and at target temperature
 MODE_PAUSE = "pause"
 MODE_PAUSED_BY_PRESET = "paused-by-preset"  # Shower paused at temperature by preset's ready_pauses_water setting
+MODE_PAUSED_BY_USER = "paused-by-user"  # Shower paused by the user (wall screen / last outlet off while main on)
+
+# Modes in which the shower is actually running water
+RUNNING_MODES = (MODE_ADJUSTING, MODE_READY)
+
+# Local HAP write pacing (empirical 2026-09-30, see home-assistant repo
+# moen-local-transport.md): serialize writes and keep >=10s between puts.
+HAP_WRITE_MIN_INTERVAL = 10  # seconds between any two HAP characteristic puts
 
 # Update interval
 UPDATE_INTERVAL = 30  # seconds

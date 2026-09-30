@@ -1,5 +1,4 @@
 """Switch platform for U by Moen."""
-import asyncio
 import logging
 from typing import Any, Optional
 
@@ -14,6 +13,8 @@ from .const import (
     ATTR_OUTLETS,
     MODE_OFF,
     MODE_PAUSED_BY_PRESET,
+    MODE_PAUSED_BY_USER,
+    RUNNING_MODES,
     ICON_SHOWER,
     ICON_OUTLET,
 )
@@ -38,10 +39,9 @@ def _local_transport(coordinator):
     return getattr(coordinator, "local", None)
 
 
-def _main_is_on(device_data: dict) -> bool:
-    """True when the shower is running (any non-off mode)."""
-    mode = device_data.get("mode", MODE_OFF)
-    return mode not in (MODE_OFF, MODE_PAUSED_BY_PRESET)
+def _is_running(device_data: dict) -> bool:
+    """True only when the shower is actively running water (adjusting/ready)."""
+    return device_data.get("mode", MODE_OFF) in RUNNING_MODES
 
 
 async def async_setup_entry(
@@ -118,24 +118,46 @@ class MoenShowerSwitch(CoordinatorEntity, SwitchEntity):
         # Otherwise use coordinator data
         device_data = self.coordinator.data[self._serial_number]
         mode = device_data.get("mode", MODE_OFF)
-        # Treat paused-by-preset like off so UI exposes resume option
-        return mode not in (MODE_OFF, MODE_PAUSED_BY_PRESET)
+        # Treat paused-by-preset / paused-by-user like off so UI exposes resume
+        return mode not in (MODE_OFF, MODE_PAUSED_BY_PRESET, MODE_PAUSED_BY_USER)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the shower on."""
-        self._optimistic_state = True  # Optimistically assume it worked
-        self.async_write_ha_state()  # Update UI immediately
-        local = _local_transport(self.coordinator)
-        if local:
-            try:
-                await local.set_main(True)
-                return
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.error("Local main-on failed, falling back to cloud: %s", err)
         device_data = self.coordinator.data[self._serial_number]
         mode = device_data.get("mode", MODE_OFF)
+        local = _local_transport(self.coordinator)
+
+        if _is_running(device_data):
+            _LOGGER.debug("Power on ignored — shower already running")
+            return
+
+        # Paused (paused-by-user / paused-by-preset): resume by opening the
+        # default outlet (local) or cloud resume. Main is already on.
+        paused = mode in (MODE_PAUSED_BY_PRESET, MODE_PAUSED_BY_USER)
+        if local and not paused:
+            try:
+                # Arm outlet 1 + main on, back-to-back — the device-native
+                # local start (verified safe; mirrors cloud shower_on which
+                # opens outlet 1). A bare main-on would park in paused-by-user.
+                await local.start_shower(1)
+                self._optimistic_state = True
+                self.async_write_ha_state()
+                return
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("Local start failed, falling back to cloud: %s", err)
+        elif local and paused:
+            try:
+                await local.set_outlet(1, True)
+                self._optimistic_state = True
+                self.async_write_ha_state()
+                return
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("Local resume failed, falling back to cloud: %s", err)
+
+        self._optimistic_state = True
+        self.async_write_ha_state()
         active_preset = device_data.get("active_preset")
-        if mode == MODE_PAUSED_BY_PRESET:
+        if paused:
             await self._api.resume_shower(self._serial_number, active_preset)
         else:
             await self._api.set_shower_mode(self._serial_number, "on")
@@ -151,7 +173,7 @@ class MoenShowerSwitch(CoordinatorEntity, SwitchEntity):
                 await local.set_main(False)
                 return
             except Exception as err:  # noqa: BLE001
-                _LOGGER.error("Local main-off failed, falling back to cloud: %s", err)
+                _LOGGER.warning("Local main-off failed, falling back to cloud: %s", err)
         await self._api.set_shower_mode(self._serial_number, MODE_OFF)
         # State will be confirmed via Pusher client-state-reported event
 
@@ -210,6 +232,15 @@ class MoenOutletSwitch(CoordinatorEntity, SwitchEntity):
         return ICON_OUTLET
 
     @property
+    def available(self) -> bool:
+        """Valve controls are only available while the shower is running —
+        the Moen app hides valve buttons when off and the physical console
+        ignores them; we match that instead of lying about state."""
+        if self._optimistic_state is not None:
+            return True
+        return _is_running(self.coordinator.data[self._serial_number])
+
+    @property
     def is_on(self) -> bool:
         """Return true if the outlet is active."""
         # If we have an optimistic state (command just sent), use that
@@ -222,116 +253,65 @@ class MoenOutletSwitch(CoordinatorEntity, SwitchEntity):
         return False
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        """Turn the outlet on."""
-        self._optimistic_state = True  # Optimistically assume it worked
+        """Turn the outlet on. No-op while the shower is not running —
+        device-side writes while off would be silently 'armed' (applied at
+        next main-on), which diverges from cloud semantics (ignored)."""
+        device_data = self.coordinator.data[self._serial_number]
+        if not _is_running(device_data):
+            _LOGGER.warning(
+                "Valve %d on ignored — shower is not running (mode=%s); "
+                "turn the shower power on first",
+                self._outlet_position,
+                device_data.get("mode", MODE_OFF),
+            )
+            return
+
+        self._optimistic_state = True  # Command accepted — safe to be optimistic
         self.async_write_ha_state()  # Update UI immediately
 
-        device_data = self.coordinator.data[self._serial_number]
         local = _local_transport(self.coordinator)
         if local:
             try:
-                await local.set_outlet(
-                    self._outlet_position, True, main_is_on=_main_is_on(device_data)
-                )
+                await local.set_outlet(self._outlet_position, True)
                 return
             except Exception as err:  # noqa: BLE001
-                _LOGGER.error(
+                _LOGGER.warning(
                     "Local valve %d on failed, falling back to cloud: %s",
                     self._outlet_position,
                     err,
                 )
 
-        current_mode = device_data.get("mode", MODE_OFF)
-
-        # If shower is off, turn it on with this outlet
-        if current_mode == MODE_OFF:
-            _LOGGER.debug("Shower is off, turning on with outlet %d", self._outlet_position)
-            await self._api.set_shower_mode(self._serial_number, "on")
-            # Wait for the device to leave 'off' before commanding outlets —
-            # the device ignores outlet commands until it reports itself on.
-            try:
-                await asyncio.wait_for(
-                    self._wait_for_running(), timeout=10
-                )
-            except TimeoutError:
-                _LOGGER.warning(
-                    "Shower did not report running in time; sending outlets_set anyway"
-                )
-        elif current_mode == MODE_PAUSED_BY_PRESET:
-            _LOGGER.debug(
-                "Shower paused by preset, resuming before enabling outlet %d",
-                self._outlet_position,
-            )
-            await self._api.resume_shower(
-                self._serial_number, device_data.get("active_preset")
-            )
-            await asyncio.sleep(0.5)
-
-        # Get current outlet states from coordinator (has real-time data from Pusher)
-        device_data = self.coordinator.data[self._serial_number]
-        outlets = device_data.get(ATTR_OUTLETS, [])
-
-        # Build new outlet states list with this outlet turned on, keeping others as-is
-        new_outlet_states = []
-        for outlet in outlets:
-            pos = outlet.get("position")
-            # Turn on this outlet, keep others in their current state
-            if pos == self._outlet_position:
-                new_outlet_states.append({"position": pos, "active": True})
-            else:
-                new_outlet_states.append({"position": pos, "active": outlet.get("active", False)})
-
-        # Get device channel for sending command
-        device_details = await self._api.get_device_details(self._serial_number)
-        channel_id = device_details.get("channel")
-        if channel_id:
-            await self._api.send_control_event(channel_id, "outlets_set", {"outlets": new_outlet_states})
+        # Cloud fallback: full outlet array (shower is running, so outlets_set applies)
+        await self._cloud_set_outlets(True)
         # State will be confirmed via Pusher client-state-reported event
 
-    async def _wait_for_running(self) -> None:
-        """Poll coordinator data until the shower reports a non-off mode."""
-        async def _running() -> bool:
-            data = self.coordinator.data[self._serial_number]
-            return data.get("mode", MODE_OFF) not in (MODE_OFF, MODE_PAUSED_BY_PRESET)
-
-        async def _request_refresh() -> None:
-            await self.coordinator.async_request_refresh()
-
-        # Poll: request a coordinator refresh (which merges a fresh local HAP
-        # read) at most ~2x/second until the device reports it is running.
-        deadline = asyncio.get_event_loop().time() + 10
-        while asyncio.get_event_loop().time() < deadline:
-            try:
-                await _request_refresh()
-            except Exception:  # noqa: BLE001
-                pass
-            if _main_is_on(self.coordinator.data[self._serial_number]):
-                return
-            await asyncio.sleep(0.5)
-        raise TimeoutError("Shower did not report running state")
-
     async def async_turn_off(self, **kwargs: Any) -> None:
-        """Turn the outlet off."""
-        self._optimistic_state = False  # Optimistically assume it worked
+        """Turn the outlet off. No-op while the shower is not running."""
+        device_data = self.coordinator.data[self._serial_number]
+        if not _is_running(device_data):
+            _LOGGER.warning(
+                "Valve %d off ignored — shower is not running (mode=%s)",
+                self._outlet_position,
+                device_data.get("mode", MODE_OFF),
+            )
+            return
+
+        self._optimistic_state = False
         self.async_write_ha_state()  # Update UI immediately
 
-        device_data = self.coordinator.data[self._serial_number]
         local = _local_transport(self.coordinator)
         if local:
             try:
-                await local.set_outlet(self._outlet_position, False, main_is_on=True)
-                # If this was the only active outlet, stop the shower entirely
-                outlets = device_data.get(ATTR_OUTLETS, [])
-                active_others = [
-                    o
-                    for o in outlets
-                    if o.get("active") and o.get("position") != self._outlet_position
-                ]
-                if not active_others:
+                await local.set_outlet(self._outlet_position, False)
+                # If that was the last active outlet, end the shower entirely —
+                # decided from a FRESH local read, not stale coordinator data.
+                state = await local.read_state()
+                if not any(state["outlets"].values()):
+                    _LOGGER.debug("Last outlet off — stopping shower (main off)")
                     await local.set_main(False)
                 return
             except Exception as err:  # noqa: BLE001
-                _LOGGER.error(
+                _LOGGER.warning(
                     "Local valve %d off failed, falling back to cloud: %s",
                     self._outlet_position,
                     err,
@@ -349,23 +329,24 @@ class MoenOutletSwitch(CoordinatorEntity, SwitchEntity):
         else:
             # Otherwise, just turn off this outlet (keep others as-is)
             _LOGGER.debug("Multiple outlets active, turning off only outlet %d", self._outlet_position)
-
-            # Build new outlet states list with this outlet turned off, keeping others as-is
-            new_outlet_states = []
-            for outlet in outlets:
-                pos = outlet.get("position")
-                # Turn off this outlet, keep others in their current state
-                if pos == self._outlet_position:
-                    new_outlet_states.append({"position": pos, "active": False})
-                else:
-                    new_outlet_states.append({"position": pos, "active": outlet.get("active", False)})
-
-            # Get device channel for sending command
-            device_details = await self._api.get_device_details(self._serial_number)
-            channel_id = device_details.get("channel")
-            if channel_id:
-                await self._api.send_control_event(channel_id, "outlets_set", {"outlets": new_outlet_states})
+            await self._cloud_set_outlets(False)
         # State will be confirmed via Pusher client-state-reported event
+
+    async def _cloud_set_outlets(self, active: bool) -> None:
+        """Cloud fallback: outlets_set with this outlet toggled, others kept."""
+        device_data = self.coordinator.data[self._serial_number]
+        outlets = device_data.get(ATTR_OUTLETS, [])
+        new_outlet_states = []
+        for outlet in outlets:
+            pos = outlet.get("position")
+            if pos == self._outlet_position:
+                new_outlet_states.append({"position": pos, "active": active})
+            else:
+                new_outlet_states.append({"position": pos, "active": outlet.get("active", False)})
+        device_details = await self._api.get_device_details(self._serial_number)
+        channel_id = device_details.get("channel")
+        if channel_id:
+            await self._api.send_control_event(channel_id, "outlets_set", {"outlets": new_outlet_states})
 
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""

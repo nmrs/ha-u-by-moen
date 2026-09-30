@@ -37,7 +37,16 @@ class MoenDataUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("Local HAP read failed, using cloud data only: %s", err)
             return
         for device_data in devices_data.values():
-            device_data["mode"] = "adjusting" if state["main"] else "off"
+            if state["main"]:
+                # main=1 with zero active outlets is the device's PAUSE state
+                # (cloud calls it paused-by-user). Any active outlet = running.
+                if any(state["outlets"].values()):
+                    if device_data.get("mode") not in ("adjusting", "ready"):
+                        device_data["mode"] = "adjusting"
+                else:
+                    device_data["mode"] = "paused-by-user"
+            else:
+                device_data["mode"] = "off"
             device_data["current_temperature"] = state["current_temp_f"]
             device_data["target_temperature"] = state["target_temp_f"]
             for outlet in device_data.get("outlets", []):

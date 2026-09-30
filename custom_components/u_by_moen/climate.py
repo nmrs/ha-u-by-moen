@@ -22,6 +22,8 @@ from .const import (
     ATTR_MAX_TEMP,
     MODE_OFF,
     MODE_PAUSED_BY_PRESET,
+    MODE_PAUSED_BY_USER,
+    RUNNING_MODES,
     ICON_SHOWER,
 )
 from .coordinator import MoenDataUpdateCoordinator
@@ -98,8 +100,9 @@ class MoenClimate(CoordinatorEntity, ClimateEntity):
         # Otherwise use coordinator data
         device_data = self.coordinator.data[self._serial_number]
         mode = device_data.get(ATTR_MODE, MODE_OFF)
-        # Treat paused-by-preset as "off" so Home Assistant exposes resume controls
-        if mode == MODE_PAUSED_BY_PRESET:
+        # Treat paused-by-preset / paused-by-user as "off" so Home Assistant
+        # exposes resume controls
+        if mode in (MODE_PAUSED_BY_PRESET, MODE_PAUSED_BY_USER):
             return HVACMode.OFF
         # Any mode other than "off" means the shower is on (adjusting, ready, pause)
         return HVACMode.HEAT if mode != MODE_OFF else HVACMode.OFF
@@ -138,34 +141,72 @@ class MoenClimate(CoordinatorEntity, ClimateEntity):
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set new HVAC mode."""
-        self._optimistic_hvac_mode = hvac_mode  # Optimistically assume it worked
-        self.async_write_ha_state()  # Update UI immediately
-        local = getattr(self.coordinator, "local", None)
-        if local:
-            try:
-                await local.set_main(hvac_mode == HVACMode.HEAT)
-                return
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.error("Local hvac write failed, falling back to cloud: %s", err)
         device_data = self.coordinator.data[self._serial_number]
         mode = device_data.get(ATTR_MODE, MODE_OFF)
+        paused = mode in (MODE_PAUSED_BY_PRESET, MODE_PAUSED_BY_USER)
+        local = getattr(self.coordinator, "local", None)
+
+        if hvac_mode == HVACMode.HEAT and mode in RUNNING_MODES:
+            _LOGGER.debug("HEAT ignored — shower already running")
+            return
+
         if hvac_mode == HVACMode.HEAT:
-            if mode == MODE_PAUSED_BY_PRESET:
+            if local and paused:
+                # Main is already on in pause; opening the default outlet resumes.
+                try:
+                    await local.set_outlet(1, True)
+                    self._optimistic_hvac_mode = hvac_mode
+                    self.async_write_ha_state()
+                    return
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.warning("Local resume failed, falling back to cloud: %s", err)
+            elif local:
+                # Arm outlet 1 + main on back-to-back (cloud shower_on equivalent).
+                try:
+                    await local.start_shower(1)
+                    self._optimistic_hvac_mode = hvac_mode
+                    self.async_write_ha_state()
+                    return
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.warning("Local start failed, falling back to cloud: %s", err)
+            self._optimistic_hvac_mode = hvac_mode
+            self.async_write_ha_state()
+            if paused:
                 await self._api.resume_shower(
                     self._serial_number, device_data.get("active_preset")
                 )
             else:
                 await self._api.set_shower_mode(self._serial_number, "on")
         elif hvac_mode == HVACMode.OFF:
+            self._optimistic_hvac_mode = hvac_mode
+            self.async_write_ha_state()
+            if local:
+                try:
+                    await local.set_main(False)
+                    return
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.warning("Local main-off failed, falling back to cloud: %s", err)
             await self._api.set_shower_mode(self._serial_number, MODE_OFF)
         # State will be confirmed via Pusher client-state-reported event
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
-        """Set new target temperature."""
+        """Set new target temperature. No-op while the shower is not running —
+        device-side writes while off would be silently 'armed' (applied at
+        next main-on), which diverges from cloud semantics (ignored)."""
         if (temperature := kwargs.get(ATTR_TEMPERATURE)) is None:
             return
 
-        self._optimistic_target_temp = temperature  # Optimistically assume it worked
+        device_data = self.coordinator.data[self._serial_number]
+        if device_data.get(ATTR_MODE, MODE_OFF) not in RUNNING_MODES:
+            _LOGGER.warning(
+                "Target temp %.1fF ignored — shower is not running (mode=%s); "
+                "cloud ignores temp changes while off, so local does too",
+                temperature,
+                device_data.get(ATTR_MODE, MODE_OFF),
+            )
+            return
+
+        self._optimistic_target_temp = temperature  # Command accepted — safe
         self.async_write_ha_state()  # Update UI immediately
         local = getattr(self.coordinator, "local", None)
         if local:
@@ -173,7 +214,7 @@ class MoenClimate(CoordinatorEntity, ClimateEntity):
                 await local.set_target_temp(temperature)
                 return
             except Exception as err:  # noqa: BLE001
-                _LOGGER.error("Local temp write failed, falling back to cloud: %s", err)
+                _LOGGER.warning("Local temp write failed, falling back to cloud: %s", err)
         await self._api.set_target_temperature(self._serial_number, temperature)
         # State will be confirmed via Pusher client-state-reported event
 
