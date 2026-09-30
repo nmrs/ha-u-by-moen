@@ -27,15 +27,8 @@ class MoenDataUpdateCoordinator(DataUpdateCoordinator):
         self.local = None  # Optional MoenLocal — set by __init__ when pairing file exists
         self.devices: Dict[str, Dict[str, Any]] = {}
 
-    async def _async_merge_local(self, devices_data: Dict[str, Dict[str, Any]]) -> None:
-        """Overlay freshly-read local HAP state onto the cloud device data."""
-        if not self.local:
-            return
-        try:
-            state = await self.local.read_state()
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.warning("Local HAP read failed, using cloud data only: %s", err)
-            return
+    def _overlay_local(self, devices_data: Dict[str, Dict[str, Any]], state: dict) -> None:
+        """Overlay local HAP state (dict from MoenLocal.latest_state) onto cloud device data."""
         for device_data in devices_data.values():
             if state["main"]:
                 # main=1 with zero active outlets is the device's PAUSE state
@@ -53,6 +46,25 @@ class MoenDataUpdateCoordinator(DataUpdateCoordinator):
                 pos = outlet.get("position")
                 if pos in state["outlets"]:
                     outlet["active"] = state["outlets"][pos]
+
+    async def _async_merge_local(self, devices_data: Dict[str, Dict[str, Any]]) -> None:
+        """Overlay freshly-read local HAP state onto the cloud device data."""
+        if not self.local:
+            return
+        try:
+            state = await self.local.read_state()
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Local HAP read failed, using cloud data only: %s", err)
+            return
+        self._overlay_local(devices_data, state)
+
+    async def apply_local_event(self) -> None:
+        """Called by the HAP event stream (MoenLocal) on pushed state changes —
+        overlays the latest known local state and notifies HA immediately."""
+        if not self.local or self.local.latest_state is None:
+            return
+        self._overlay_local(self.devices, self.local.latest_state)
+        self.async_set_updated_data(self.devices)
 
     async def _async_update_data(self) -> Dict[str, Dict[str, Any]]:
         """Fetch data from API."""

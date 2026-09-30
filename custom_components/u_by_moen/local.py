@@ -52,14 +52,49 @@ def f_to_c(fahrenheit: float) -> float:
 class MoenLocal:
     """Direct HAP session with the shower over the LAN."""
 
+    # Minimum seconds between coordinator pushes driven ONLY by streaming
+    # current-temp events (they arrive ~2s apart while running; state
+    # changes like main/outlets always push immediately).
+    TEMP_EVENT_THROTTLE = 5.0
+
     def __init__(self, hass, pairing_data: dict):
         self._controller = Controller()
         self._pairing = IpPairing(self._controller, dict(pairing_data))
+        self._hass = hass
         # Serialize ALL HAP traffic through one session. Concurrent sessions
         # are the suspected device-crash trigger; rapid puts on one session
         # are safe (verified), but we still pace writes to be conservative.
         self._lock = asyncio.Lock()
         self._last_write = 0.0
+        # Latest known local state, updated by both reads and pushed events:
+        # {'main': bool, 'outlets': {pos: bool}, 'current_temp_f': float,
+        #  'target_temp_f': float} — consumed by the coordinator overlay.
+        self.latest_state: dict | None = None
+        self._subscribed = False
+        self._last_temp_push = 0.0
+        self._event_listener = None
+
+    def _absorb(self, values: dict) -> None:
+        """Fold raw {(aid, iid): {'value': v}} into latest_state."""
+        def raw(iid):
+            return values.get((1, iid), {}).get("value")
+
+        if self.latest_state is None:
+            self.latest_state = {
+                "main": False,
+                "outlets": {pos: False for pos in OUTLET_ACTIVE_IIDS},
+                "current_temp_f": 0.0,
+                "target_temp_f": 0.0,
+            }
+        if (v := raw(MAIN_ACTIVE_IID)) is not None:
+            self.latest_state["main"] = bool(v)
+        for pos, iid in OUTLET_ACTIVE_IIDS.items():
+            if (v := raw(iid)) is not None:
+                self.latest_state["outlets"][pos] = bool(v)
+        if (v := raw(HEATER_CURRENT_TEMP_IID)) is not None:
+            self.latest_state["current_temp_f"] = c_to_f(float(v))
+        if (v := raw(HEATER_TARGET_TEMP_IID)) is not None:
+            self.latest_state["target_temp_f"] = c_to_f(float(v))
 
     @classmethod
     def read_pairing_file(cls, hass):
@@ -78,12 +113,14 @@ class MoenLocal:
         """Read characteristics (serialized; one retry on transient failure)."""
         async with self._lock:
             try:
-                return await self._pairing.get_characteristics(pairs)
+                result = await self._pairing.get_characteristics(pairs)
             except Exception:
                 # Transient transport errors observed (e.g. OSError 49); one
                 # spaced retry before surfacing the failure.
                 await asyncio.sleep(2)
-                return await self._pairing.get_characteristics(pairs)
+                result = await self._pairing.get_characteristics(pairs)
+        self._absorb(result)
+        return result
 
     async def _put(self, pairs):
         """Write one characteristic pair, serialized and paced."""
@@ -158,6 +195,69 @@ class MoenLocal:
     async def set_target_temp(self, fahrenheit: float) -> None:
         await self._put([(1, HEATER_TARGET_TEMP_IID, f_to_c(fahrenheit))])
         _LOGGER.debug("local: target temp %.1fF", fahrenheit)
+
+    async def start_event_stream(self, notify) -> bool:
+        """Subscribe to HAP push events (device advertises ev on all our
+        characteristics; verified live 2026-09-30) and push state into the
+        coordinator. `notify` is an async callable receiving nothing — the
+        caller (coordinator) reads self.latest_state. Returns True when
+        subscribed. The 30s poll remains as the backstop."""
+        if self._subscribed:
+            return True
+        pairs = [(1, iid) for iid in (MAIN_ACTIVE_IID, HEATER_CURRENT_TEMP_IID, HEATER_TARGET_TEMP_IID, *OUTLET_ACTIVE_IIDS.values())]
+
+        def on_event(values: dict) -> None:
+            if values in (None, {}):  # EMPTY_EVENT = connection restored
+                return
+            self._absorb(values)
+            state_chars = any(k[1] != HEATER_CURRENT_TEMP_IID for k in values)
+            now = time.monotonic()
+            if not state_chars and now - self._last_temp_push < self.TEMP_EVENT_THROTTLE:
+                return  # temp-only burst, throttled
+            self._last_temp_push = now
+            if state_chars:
+                _LOGGER.info(
+                    "HAP event: main=%s outlets=%s",
+                    self.latest_state["main"],
+                    self.latest_state["outlets"],
+                )
+            hass = getattr(self, "_hass", None)
+            if hass is not None:
+                hass.async_create_task(notify())
+            else:
+                notify()
+
+        self._event_listener = on_event
+        self._pairing.listeners.add(on_event)
+        try:
+            result = await self._pairing.subscribe(pairs)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("HAP event subscription failed, falling back to 30s polling: %s", err)
+            self._pairing.listeners.discard(on_event)
+            self._event_listener = None
+            return False
+        self._subscribed = True
+        if result is None:
+            # Device reports it does not support push (aiohomekit flag)
+            _LOGGER.info("Shower reports no HAP push support; keeping 30s polling only")
+            self._pairing.listeners.discard(on_event)
+            self._event_listener = None
+            self._subscribed = False
+            return False
+        _LOGGER.info("HAP event stream active (local push, no cloud)")
+        return True
+
+    async def stop_event_stream(self) -> None:
+        if not self._subscribed:
+            return
+        if self._event_listener is not None:
+            self._pairing.listeners.discard(self._event_listener)
+            self._event_listener = None
+        self._subscribed = False
+        try:
+            await self._pairing.close()
+        except Exception:  # noqa: BLE001
+            pass
 
     async def close(self) -> None:
         try:

@@ -51,6 +51,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Fetch initial data
     await coordinator.async_config_entry_first_refresh()
 
+    # Start the local HAP event stream (push state, no cloud) — best effort;
+    # the 30s poll remains as the backstop if subscribe fails.
+    if local:
+        try:
+            await local.start_event_stream(coordinator.apply_local_event)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Failed to start HAP event stream: %s", err)
+
     # Store coordinator and API
     hass.data[DOMAIN][entry.entry_id] = {
         "coordinator": coordinator,
@@ -144,6 +152,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         local = hass.data[DOMAIN][entry.entry_id].get("local")
         if local:
+            await local.stop_event_stream()
             await local.close()
 
         # Remove the entry
