@@ -135,17 +135,25 @@ class MoenLocal:
     async def start_shower(self, position: int = 1) -> None:
         """Start the shower the way the device natively expects: arm the
         outlet, then immediately turn main on — back-to-back on one session.
-        Verified safe (no wedge) and cloud-equivalent in outcome: outlet
-        opens at start, water/heating begins (unlike main-on alone, which
-        parks the shower in paused-by-user)."""
+        Verified safe (no wedge; six back-to-back puts fine) and
+        cloud-equivalent in outcome.
+
+        Also CLEARS any stale armed outlets/target first: armed writes
+        persist across main on/off cycles on this device (main-off clears
+        active outlets but not the armed set — they re-apply at the next
+        main-on, as observed 2026-09-30 with a stale armed outlet 2 + temp).
+        Target is set to 100F, matching cloud shower_on preset 0."""
         iid = OUTLET_ACTIVE_IIDS.get(position)
         if iid is None:
             raise ValueError(f"Unknown outlet position {position}")
         async with self._lock:
-            await self._pairing.put_characteristics([(1, iid, 1)])
-            await self._pairing.put_characteristics([(1, MAIN_ACTIVE_IID, 1)])
+            puts = [(1, i, 1 if pos == position else 0) for pos, i in OUTLET_ACTIVE_IIDS.items()]
+            puts.append((1, HEATER_TARGET_TEMP_IID, f_to_c(100)))
+            puts.append((1, MAIN_ACTIVE_IID, 1))
+            for pair in puts:
+                await self._pairing.put_characteristics([pair])
             self._last_write = time.monotonic()
-        _LOGGER.debug("local: shower start (outlet %d armed + main on)", position)
+        _LOGGER.debug("local: shower start (clear armed, outlet %d + temp 100F + main on)", position)
 
     async def set_target_temp(self, fahrenheit: float) -> None:
         await self._put([(1, HEATER_TARGET_TEMP_IID, f_to_c(fahrenheit))])
